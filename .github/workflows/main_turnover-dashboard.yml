@@ -46,9 +46,9 @@ jobs:
             Copy-Item -Path public -Destination deploy_package/public -Recurse -Force
           }
 
-          if (Test-Path web.config) {
-            Copy-Item -Path web.config -Destination deploy_package/web.config -Force
-          }
+          # Replace Next standalone server (parseInt PORT) with Azure/iisnode-compatible server
+          Copy-Item -Path server.js -Destination deploy_package/server.js -Force
+          Copy-Item -Path web.config -Destination deploy_package/web.config -Force
 
           # Stop Kudu from running npm install again (fills App Service disk → ENOSPC)
           @"
@@ -56,18 +56,13 @@ jobs:
           SCM_DO_BUILD_DURING_DEPLOYMENT=false
           "@ | Set-Content -Path deploy_package/.deployment -Encoding utf8
 
-          # Keep start script only so Azure does not reinstall dependencies
+          # Keep dependencies from standalone package.json; only ensure start script
           $pkgPath = "deploy_package/package.json"
           if (Test-Path $pkgPath) {
             $pkg = Get-Content $pkgPath -Raw | ConvertFrom-Json
-            $lean = [ordered]@{
-              name = $pkg.name
-              version = $pkg.version
-              private = $true
-              scripts = @{ start = "node server.js" }
-              engines = @{ node = "22.x" }
-            }
-            $lean | ConvertTo-Json -Depth 5 | Set-Content -Path $pkgPath -Encoding utf8
+            if (-not $pkg.scripts) { $pkg | Add-Member -NotePropertyName scripts -NotePropertyValue (@{}) }
+            $pkg.scripts | Add-Member -NotePropertyName start -NotePropertyValue "node server.js" -Force
+            $pkg | ConvertTo-Json -Depth 10 | Set-Content -Path $pkgPath -Encoding utf8
           }
 
       - name: Upload artifact for deployment job

@@ -80,6 +80,68 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: node-app
+          path: deploy_package
+
+      - name: Free App Service disk before deploy
+        env:
+          PUBLISH_PROFILE: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_9EE1E27F284E4B34B38D64CDC383452C }}
+        run: |
+          set -euo pipefail
+
+          # Prefer MSDeploy credentials from the publish profile XML
+          USERNAME=$(python3 - <<'PY'
+          import os, re
+          xml = os.environ["PUBLISH_PROFILE"]
+          profiles = re.findall(r"<publishProfile\b[^>]*>", xml)
+          chosen = next((p for p in profiles if 'publishMethod="MSDeploy"' in p), profiles[0] if profiles else "")
+          m = re.search(r'userName="([^"]+)"', chosen)
+          print(m.group(1) if m else "")
+          PY
+          )
+          PASSWORD=$(python3 - <<'PY'
+          import os, re
+          xml = os.environ["PUBLISH_PROFILE"]
+          profiles = re.findall(r"<publishProfile\b[^>]*>", xml)
+          chosen = next((p for p in profiles if 'publishMethod="MSDeploy"' in p), profiles[0] if profiles else "")
+          m = re.search(r'userPWD="([^"]+)"', chosen)
+          print(m.group(1) if m else "")
+          PY
+          )
+
+          if [ -z "$USERNAME" ] || [ -z "$PASSWORD" ]; then
+            echo "Could not parse publish profile credentials"
+            exit 1
+          fi
+
+          SCM_URL="https://turnover-dashboard.scm.azurewebsites.net"
+
+          python3 - <<'PY' > /tmp/kudu-clean.json
+          import json
+          cmd = (
+              "powershell -NoProfile -Command "
+              "\"Get-Process node -ErrorAction SilentlyContinue | Stop-Process -Force; "
+              "Remove-Item -LiteralPath 'C:\\home\\site\\wwwroot\\*' -Recurse -Force -ErrorAction SilentlyContinue; "
+              "Remove-Item -LiteralPath 'C:\\home\\data\\SitePackages\\*' -Recurse -Force -ErrorAction SilentlyContinue; "
+              "Remove-Item -LiteralPath 'C:\\local\\Temp\\zipdeploy\\*' -Recurse -Force -ErrorAction SilentlyContinue; "
+              "Remove-Item -LiteralPath 'C:\\home\\site\\deployments\\temp\\*' -Recurse -Force -ErrorAction SilentlyContinue\""
+          )
+          print(json.dumps({"command": cmd, "dir": r"C:\home"}))
+          PY
+
+          echo "Cleaning App Service disk via Kudu..."
+          curl -sS -u "$USERNAME:$PASSWORD" \
+            -H "Content-Type: application/json" \
+            -X POST "$SCM_URL/api/command" \
+            --data-binary @/tmp/kudu-clean.json
+
+          echo
+          echo "Disk cleanup finished."
+
+      - name: Create deployment zip
+        run: |
+          cd deploy_package
+          zip -r ../site.zip . -q
+          ls -lh ../site.zip
 
       - name: 'Deploy to Azure Web App'
         uses: azure/webapps-deploy@v3
@@ -87,5 +149,5 @@ jobs:
         with:
           app-name: 'turnover-dashboard'
           slot-name: 'Production'
-          package: .
+          package: site.zip
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_9EE1E27F284E4B34B38D64CDC383452C }}

@@ -82,60 +82,72 @@ jobs:
           name: node-app
           path: deploy_package
 
-      - name: Free App Service disk before deploy
+      - name: Parse publish profile
         env:
           PUBLISH_PROFILE: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_9EE1E27F284E4B34B38D64CDC383452C }}
         run: |
+          python3 <<'PY'
+          import os, re
+          xml = os.environ["PUBLISH_PROFILE"]
+          profiles = re.findall(r"<publishProfile\b[^>]*>", xml)
+          chosen = next((p for p in profiles if 'publishMethod="MSDeploy"' in p), profiles[0] if profiles else "")
+          user = re.search(r'userName="([^"]+)"', chosen)
+          pwd = re.search(r'userPWD="([^"]+)"', chosen)
+          if not user or not pwd:
+              raise SystemExit("Could not parse publish profile credentials")
+          open("/tmp/kudu_user.txt", "w", encoding="utf-8").write(user.group(1))
+          open("/tmp/kudu_pass.txt", "w", encoding="utf-8").write(pwd.group(1))
+          print("Publish profile credentials loaded")
+          PY
+
+      - name: Free App Service disk before deploy
+        run: |
           set -euo pipefail
-
-          # Prefer MSDeploy credentials from the publish profile XML
-          USERNAME=$(python3 - <<'PY'
-          import os, re
-          xml = os.environ["PUBLISH_PROFILE"]
-          profiles = re.findall(r"<publishProfile\b[^>]*>", xml)
-          chosen = next((p for p in profiles if 'publishMethod="MSDeploy"' in p), profiles[0] if profiles else "")
-          m = re.search(r'userName="([^"]+)"', chosen)
-          print(m.group(1) if m else "")
-          PY
-          )
-          PASSWORD=$(python3 - <<'PY'
-          import os, re
-          xml = os.environ["PUBLISH_PROFILE"]
-          profiles = re.findall(r"<publishProfile\b[^>]*>", xml)
-          chosen = next((p for p in profiles if 'publishMethod="MSDeploy"' in p), profiles[0] if profiles else "")
-          m = re.search(r'userPWD="([^"]+)"', chosen)
-          print(m.group(1) if m else "")
-          PY
-          )
-
-          if [ -z "$USERNAME" ] || [ -z "$PASSWORD" ]; then
-            echo "Could not parse publish profile credentials"
-            exit 1
-          fi
-
+          KUDU_USER=$(cat /tmp/kudu_user.txt)
+          KUDU_PASS=$(cat /tmp/kudu_pass.txt)
           SCM_URL="https://turnover-dashboard.scm.azurewebsites.net"
 
-          python3 - <<'PY' > /tmp/kudu-clean.json
+          echo "Disk free space BEFORE cleanup:"
+          curl -sS -u "$KUDU_USER:$KUDU_PASS" \
+            -H "Content-Type: application/json" \
+            -X POST "$SCM_URL/api/command" \
+            -d '{"command":"powershell -NoProfile -Command \"Get-PSDrive C | Select-Object Used,Free | Format-List\"","dir":"C:\\home"}' || true
+          echo
+
+          python3 <<'PY' > /tmp/kudu-clean.json
           import json
           cmd = (
               "powershell -NoProfile -Command "
-              "\"Get-Process node -ErrorAction SilentlyContinue | Stop-Process -Force; "
+              "\"Get-Process node,iisnode -ErrorAction SilentlyContinue | Stop-Process -Force; "
               "Remove-Item -LiteralPath 'C:\\home\\site\\wwwroot\\*' -Recurse -Force -ErrorAction SilentlyContinue; "
               "Remove-Item -LiteralPath 'C:\\home\\data\\SitePackages\\*' -Recurse -Force -ErrorAction SilentlyContinue; "
               "Remove-Item -LiteralPath 'C:\\local\\Temp\\zipdeploy\\*' -Recurse -Force -ErrorAction SilentlyContinue; "
-              "Remove-Item -LiteralPath 'C:\\home\\site\\deployments\\temp\\*' -Recurse -Force -ErrorAction SilentlyContinue\""
+              "Remove-Item -LiteralPath 'C:\\home\\site\\deployments\\temp\\*' -Recurse -Force -ErrorAction SilentlyContinue; "
+              "if (Test-Path 'C:\\local\\LocalAppData\\npm-cache') { Remove-Item 'C:\\local\\LocalAppData\\npm-cache\\*' -Recurse -Force -ErrorAction SilentlyContinue }\""
           )
           print(json.dumps({"command": cmd, "dir": r"C:\home"}))
           PY
 
           echo "Cleaning App Service disk via Kudu..."
-          curl -sS -u "$USERNAME:$PASSWORD" \
+          curl -sS -u "$KUDU_USER:$KUDU_PASS" \
             -H "Content-Type: application/json" \
             -X POST "$SCM_URL/api/command" \
             --data-binary @/tmp/kudu-clean.json
-
           echo
-          echo "Disk cleanup finished."
+
+          echo "Disable build-during-deploy..."
+          curl -sS -u "$KUDU_USER:$KUDU_PASS" \
+            -H "Content-Type: application/json" \
+            -X POST "$SCM_URL/api/settings" \
+            -d '{"SCM_DO_BUILD_DURING_DEPLOYMENT":"false"}' || true
+          echo
+
+          echo "Disk free space AFTER cleanup:"
+          curl -sS -u "$KUDU_USER:$KUDU_PASS" \
+            -H "Content-Type: application/json" \
+            -X POST "$SCM_URL/api/command" \
+            -d '{"command":"powershell -NoProfile -Command \"Get-PSDrive C | Select-Object Used,Free | Format-List\"","dir":"C:\\home"}' || true
+          echo
 
       - name: Create deployment zip
         run: |
@@ -143,11 +155,29 @@ jobs:
           zip -r ../site.zip . -q
           ls -lh ../site.zip
 
-      - name: 'Deploy to Azure Web App'
-        uses: azure/webapps-deploy@v3
-        id: deploy-to-webapp
-        with:
-          app-name: 'turnover-dashboard'
-          slot-name: 'Production'
-          package: site.zip
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_9EE1E27F284E4B34B38D64CDC383452C }}
+      - name: Deploy via Kudu ZipDeploy (classic, not OneDeploy)
+        run: |
+          set -euo pipefail
+          KUDU_USER=$(cat /tmp/kudu_user.txt)
+          KUDU_PASS=$(cat /tmp/kudu_pass.txt)
+          SCM_URL="https://turnover-dashboard.scm.azurewebsites.net"
+
+          echo "Uploading site.zip via /api/zipdeploy (classic)..."
+          HTTP_CODE=$(curl -sS -o /tmp/zipdeploy_out.txt -w "%{http_code}" \
+            -u "$KUDU_USER:$KUDU_PASS" \
+            -H "Content-Type: application/zip" \
+            -X POST "$SCM_URL/api/zipdeploy?isAsync=false" \
+            --data-binary @site.zip || true)
+
+          echo "ZipDeploy HTTP status: $HTTP_CODE"
+          cat /tmp/zipdeploy_out.txt || true
+          echo
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "Classic zipdeploy failed with $HTTP_CODE"
+            exit 1
+          fi
+
+          echo "Requesting app restart..."
+          curl -sS -u "$KUDU_USER:$KUDU_PASS" -X POST "$SCM_URL/api/app/restart" || true
+          echo "Deploy finished."

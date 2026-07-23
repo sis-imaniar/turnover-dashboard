@@ -149,6 +149,75 @@ jobs:
             -d '{"command":"powershell -NoProfile -Command \"Get-PSDrive C | Select-Object Used,Free | Format-List\"","dir":"C:\\home"}' || true
           echo
 
+      - name: Detect Node.js path on App Service
+        run: |
+          set -euo pipefail
+          KUDU_USER=$(cat /tmp/kudu_user.txt)
+          KUDU_PASS=$(cat /tmp/kudu_pass.txt)
+          SCM_URL="https://turnover-dashboard.scm.azurewebsites.net"
+
+          python3 <<'PY' > /tmp/kudu-find-node.json
+          import json
+          cmd = (
+              "powershell -NoProfile -Command "
+              "\"$paths = New-Object System.Collections.Generic.List[string]; "
+              "@('D:\\Program Files (x86)\\nodejs\\node.exe','D:\\Program Files\\nodejs\\node.exe') | ForEach-Object { [void]$paths.Add($_) }; "
+              "Get-ChildItem 'D:\\Program Files (x86)\\nodejs' -Directory -ErrorAction SilentlyContinue | ForEach-Object { [void]$paths.Add((Join-Path $_.FullName 'node.exe')) }; "
+              "Get-ChildItem 'D:\\Program Files\\nodejs' -Directory -ErrorAction SilentlyContinue | ForEach-Object { [void]$paths.Add((Join-Path $_.FullName 'node.exe')) }; "
+              "$found = $paths | Where-Object { Test-Path $_ } | Select-Object -First 1; "
+              "if ($found) { Write-Output ('FOUND=' + $found) } else { Write-Output 'FOUND='; Write-Output 'DIR_X86='; Get-ChildItem 'D:\\Program Files (x86)\\nodejs' -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }; Write-Output 'DIR_PF='; Get-ChildItem 'D:\\Program Files\\nodejs' -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName } }\""
+          )
+          print(json.dumps({"command": cmd, "dir": r"C:\home"}))
+          PY
+
+          echo "Looking up node.exe on App Service..."
+          RESP=$(curl -sS -u "$KUDU_USER:$KUDU_PASS" \
+            -H "Content-Type: application/json" \
+            -X POST "$SCM_URL/api/command" \
+            --data-binary @/tmp/kudu-find-node.json)
+          echo "$RESP"
+
+          NODE_PATH=$(RESP="$RESP" python3 <<'PY'
+          import json, os, re
+          raw = os.environ["RESP"]
+          try:
+              data = json.loads(raw)
+              out = data.get("Output") or data.get("output") or ""
+          except Exception:
+              out = raw
+          m = re.search(r"FOUND=([A-Za-z]:\\[^\r\n]+node\.exe)", out)
+          if m:
+              print(m.group(1).strip())
+          else:
+              m2 = re.search(r"[A-Za-z]:\\[^\r\n\"]+node\.exe", out)
+              print(m2.group(0).strip() if m2 else "")
+          PY
+          )
+
+          if [ -z "$NODE_PATH" ]; then
+            echo "WARNING: could not detect node.exe; falling back to 22.22.2 path"
+            NODE_PATH='D:\Program Files (x86)\nodejs\22.22.2\node.exe'
+          fi
+          echo "Using NODE_PATH=$NODE_PATH"
+          printf '%s' "$NODE_PATH" > /tmp/node_path.txt
+
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+          node_path = Path("/tmp/node_path.txt").read_text(encoding="utf-8").strip()
+          cfg_path = Path("deploy_package/web.config")
+          xml = cfg_path.read_text(encoding="utf-8")
+          attr = node_path.replace("&", "&amp;")
+          replacement = f'nodeProcessCommandLine="&quot;{attr}&quot;"'
+          if "nodeProcessCommandLine=" in xml:
+              xml = re.sub(r'nodeProcessCommandLine="[^"]*"', replacement, xml, count=1)
+          else:
+              xml = xml.replace("<iisnode ", f"<iisnode {replacement} ", 1)
+          cfg_path.write_text(xml, encoding="utf-8")
+          print("Patched web.config nodeProcessCommandLine")
+          print(cfg_path.read_text(encoding="utf-8"))
+          PY
+
       - name: Create deployment zip
         run: |
           cd deploy_package
